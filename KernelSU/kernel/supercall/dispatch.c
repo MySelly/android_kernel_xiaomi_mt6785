@@ -1,3 +1,7 @@
+#ifdef CONFIG_KSU_SUSFS
+#include <linux/susfs.h>
+#endif // #ifdef CONFIG_KSU_SUSFS
+
 static int do_grant_root(void __user *arg)
 {
 	int ret;
@@ -86,6 +90,9 @@ static int do_report_event(void __user *arg)
 			boot_complete_lock = true;
 			pr_info("boot_complete triggered\n");
 			on_boot_completed();
+#ifdef CONFIG_KSU_SUSFS
+			susfs_start_sdcard_monitor_fn();
+#endif // #ifdef CONFIG_KSU_SUSFS
 		}
 		break;
 	}
@@ -339,8 +346,13 @@ static int do_get_feature(void __user *arg)
 		return -EFAULT;
 	}
 
+	bool is_avc_spoof = (cmd.feature_id == 10003);
+	if (is_avc_spoof) cmd.feature_id = 4; // KSU_FEATURE_SELINUX_HIDE
+
 	ret = ksu_get_feature(cmd.feature_id, &cmd.value, &supported);
 	cmd.supported = supported ? 1 : 0;
+
+	if (is_avc_spoof) cmd.feature_id = 10003;
 
 	if (ret && supported) {
 		pr_err("get_feature: failed for feature %u: %d\n", cmd.feature_id, ret);
@@ -364,6 +376,9 @@ static int do_set_feature(void __user *arg)
 		pr_err("set_feature: copy_from_user failed\n");
 		return -EFAULT;
 	}
+
+	bool is_avc_spoof = (cmd.feature_id == 10003);
+	if (is_avc_spoof) cmd.feature_id = 4; // KSU_FEATURE_SELINUX_HIDE
 
 	ret = ksu_set_feature(cmd.feature_id, cmd.value);
 	if (ret) {
@@ -452,6 +467,50 @@ static int do_manage_mark(void __user *arg)
 	return 0;
 }
 
+static int do_get_hook_mode(void __user *arg)
+{
+	struct ksu_get_hook_mode_cmd cmd = {0};
+	const char *type = "Manual";
+
+#ifdef CONFIG_KSU_KPROBES_KSUD
+	type = "Kprobes";
+#elif defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE) || \
+      defined(CONFIG_KSU_HACK_ARM64_BRANCH_LINK)
+	type = "Hookless";
+#endif
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
+	strscpy(cmd.mode, type, sizeof(cmd.mode));
+#else
+	strlcpy(cmd.mode, type, sizeof(cmd.mode));
+#endif
+
+	if (copy_to_user(arg, &cmd, sizeof(cmd))) {
+		pr_err("get_hook_mode: copy_to_user failed\n");
+		return -EFAULT;
+	}
+
+	return 0;
+}
+
+static int do_get_version_tag(void __user *arg)
+{
+	struct ksu_get_version_tag_cmd cmd = {0};
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
+	strscpy(cmd.tag, KERNEL_SU_VERSION_TAG, sizeof(cmd.tag));
+#else
+	strlcpy(cmd.tag, KERNEL_SU_VERSION_TAG, sizeof(cmd.tag));
+#endif
+
+	if (copy_to_user(arg, &cmd, sizeof(cmd))) {
+		pr_err("get_version_tag: copy_to_user failed\n");
+		return -EFAULT;
+	}
+
+	return 0;
+}
+
 static int do_nuke_ext4_sysfs(void __user *arg)
 {
 	struct ksu_nuke_ext4_sysfs_cmd cmd;
@@ -483,13 +542,33 @@ static int do_nuke_ext4_sysfs(void __user *arg)
 }
 
 struct list_head mount_list = LIST_HEAD_INIT(mount_list);
+
+/*
+ * NOTE: DECLARE_RWSEM(mount_list_lock) used to be declared here at file
+ * scope, but on this kernel's rwsem/lockdep configuration the resulting
+ * __RWSEM_INITIALIZER() expansion is not a compile-time constant, which
+ * makes GCC fail with "initializer element is not constant" for
+ * mount_list_lock.wait_lock. To stay compatible across kernel configs we
+ * declare the semaphore uninitialized and lazily init it on first use
+ * instead (this file has a single entry point, add_try_umount(), so a
+ * simple once-guard is sufficient and safe under concurrent ioctls).
+ */
 struct rw_semaphore mount_list_lock;
+static atomic_t mount_list_lock_ready = ATOMIC_INIT(0);
+
+static inline void ensure_mount_list_lock_init(void)
+{
+	if (unlikely(atomic_cmpxchg(&mount_list_lock_ready, 0, 1) == 0))
+		init_rwsem(&mount_list_lock);
+}
 
 static int add_try_umount(void __user *arg)
 {
 	struct mount_entry *new_entry, *entry, *tmp;
 	struct ksu_add_try_umount_cmd cmd;
 	char buf[256] = {0};
+
+	ensure_mount_list_lock_init();
 
 	if (copy_from_user(&cmd, arg, sizeof cmd))
 		return -EFAULT;
@@ -689,6 +768,65 @@ static int do_disable_escape_to_root(void __user *arg)
 	return 0;
 }
 
+#if defined(CONFIG_KSU_HACK_ARM64_BRANCH_LINK)
+char hook_type[] = "Branch Link x/3";
+#elif defined(CONFIG_KSU_TAMPER_SYSCALL_TABLE)
+const char *hook_type = "Syscall Table Tamper";
+#elif defined(CONFIG_KSU_KPROBES_KSUD)
+# ifdef CONFIG_KSU_SUSFS
+const char *hook_type = "De-inlined SUSFS / Hybrid";
+# else
+const char *hook_type = "Hybrid";
+# endif
+#else
+# ifdef CONFIG_KSU_SUSFS
+const char *hook_type = "De-inlined SUSFS / Manual";
+# else
+const char *hook_type = "Manual";
+# endif
+#endif
+
+static int do_get_hook_type(void __user *arg)
+{
+    struct ksu_hook_type_cmd cmd = { 0 };
+
+    strscpy(cmd.hook_type, hook_type, sizeof(cmd.hook_type));
+
+    if (copy_to_user(arg, &cmd, sizeof(cmd))) {
+        pr_err("get_hook_type: copy_to_user failed\n");
+        return -EFAULT;
+    }
+
+    return 0;
+}
+
+static int do_get_susfs_version(void __user *arg)
+{
+    struct ksu_susfs_version_cmd cmd = { 0 };
+
+#ifdef CONFIG_KSU_SUSFS
+    strscpy(cmd.version, SUSFS_VERSION, sizeof(cmd.version));
+#else
+    strscpy(cmd.version, "Not supported", sizeof(cmd.version));
+#endif
+
+    if (copy_to_user(arg, &cmd, sizeof(cmd))) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
+static int do_get_driver_name(void __user *arg)
+{
+    struct ksu_driver_name_cmd cmd = { 0 };
+    strscpy(cmd.name, "BACKSLASHXX", sizeof(cmd.name));
+
+    if (copy_to_user(arg, &cmd, sizeof(cmd))) {
+        return -EFAULT;
+    }
+    return 0;
+}
+
 // IOCTL handlers mapping table
 static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
 	{ .cmd = KSU_IOCTL_GRANT_ROOT, .name = "GRANT_ROOT", .handler = do_grant_root, .perm_check = allowed_for_su },
@@ -715,6 +853,11 @@ static const struct ksu_ioctl_cmd_map ksu_ioctl_handlers[] = {
 	{ .cmd = KSU_IOCTL_SET_INIT_PGRP, .name = "SET_INIT_PGRP", .handler = do_set_init_pgrp, .perm_check = only_root },
 	{ .cmd = KSU_IOCTL_GET_SULOG_FD, .name = "GET_SULOG_FD", .handler = do_get_sulog_fd, .perm_check = only_root },
 	{ .cmd = KSU_IOCTL_DISABLE_ESCAPE_TO_ROOT, .name = "DISABLE_ESCAPE_TO_ROOT", .handler = do_disable_escape_to_root, .perm_check = only_root, .allow_su_session = true },
+	{ .cmd = KSU_IOCTL_GET_HOOK_MODE, .name = "GET_HOOK_MODE", .handler = do_get_hook_mode, .perm_check = manager_or_root },
+	{ .cmd = KSU_IOCTL_GET_VERSION_TAG, .name = "GET_VERSION_TAG", .handler = do_get_version_tag, .perm_check = manager_or_root },
+	{ .cmd = KSU_IOCTL_HOOK_TYPE, .name = "HOOK_TYPE", .handler = do_get_hook_type, .perm_check = manager_or_root },
+	{ .cmd = KSU_IOCTL_SUSFS_VERSION, .name = "SUSFS_VERSION", .handler = do_get_susfs_version, .perm_check = manager_or_root },
+	{ .cmd = KSU_IOCTL_DRIVER_NAME, .name = "DRIVER_NAME", .handler = do_get_driver_name, .perm_check = manager_or_root },
 	{ .cmd = 0, .name = NULL, .handler = NULL, .perm_check = NULL } // Sentinel
 };
 
@@ -746,8 +889,6 @@ long ksu_supercall_handle_ioctl(const struct file *filp, unsigned int cmd, void 
 void __init ksu_supercall_dump_commands(void)
 {
 	int i;
-
-	init_rwsem(&mount_list_lock);
 
 	pr_info("KernelSU IOCTL Commands:\n");
 	for (i = 0; ksu_ioctl_handlers[i].handler; i++) {
